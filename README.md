@@ -36,6 +36,7 @@ gh [options] <file1> [file2...]
 | `-i` | `--ignore` | Process files regardless of their extension. |
 | `-l` | `--log <file>` | Save results to a specified text file. |
 | `-s` | `--silent` | Hide detailed output; show only a progress bar (requires `-l`). |
+| `-r` | `--resursive` | Perform the hash on other directories recursively. |
 
 ### Examples
 **Standard Batch Processing:**
@@ -45,6 +46,10 @@ gh -l results.log movie1.mp4 movie2.mkv
 **Background/Silent Processing:**
 ```
 gh -s -l scan_results.txt /path/to/media/*.mp4
+```
+**Recursively process all videos in the directory:**
+```
+gh -r -l scan.txt ./movies
 ```
 
 ## 🧠 How it Works
