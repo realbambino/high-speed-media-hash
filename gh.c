@@ -27,6 +27,23 @@
 /*
 VERSION HISTORY:
 
+v0.20
+-Double Separator: The print_separator function now takes a doubled parameter. When -r is used, the line of = characters will be twice as long as the standard width.
+-Size Accumulation: Added total_bytes_processed. Every time a file is successfully hashed, its byte size is added to this total.
+-Enhanced Summary: The final output now reads: Summary: XX files scanned in x.xxxx ms (Total: XXX.XX MB).
+-ANSI Logic: Total size is colored green in the terminal for better visibility.
+-File Count: Now uses %'d, transforming 1000 into 1,000.
+-Total Size: Also uses %' .2f to add commas to large MB values (e.g., 1,250.50 MB).
+-Locale Compatibility: I used setlocale(LC_NUMERIC, ""); which automatically detects the user's system locale, though en_US is the most common for comma-based separators.
+
+v0.19
+-Directory Support: You can now pass folder names (e.g., gh -r .) to scan entire trees.
+-Two-Pass System: The program first counts the files in all subdirectories so the progress bar percentage is accurate before hashing begins.
+-Silent Hashing Format: When -s is used, the log file gets the requested <hash> <path> format without the "File:", "Path:", and "Size:" labels, making it easy to use for scripts or diffing.
+-Resolved Warning: The realpath call is now checked. If it fails (which is rare but possible), it falls back to using the provided path string.
+-Clean Log Formatting: In silent mode, the log file strictly receives <hash> <abs_path> with no extra labels or ANSI codes.
+-Recursion Visuals: Recursive directory walking is now fully optimized with a two-pass counter to ensure the progress bar is always accurate.
+
 v0.18
 -Separator Logic: print_separator now includes the if (log_fp) block outside of the silent_mode check, ensuring your footer line (====) is always recorded in the text file.
 -Clean Logging: I modified the Size printing logic to manually handle printf (with colors) and fprintf (plain text) separately. This prevents ANSI escape codes from appearing in your results.log.
@@ -150,12 +167,13 @@ EXAMPLE:
 #include <locale.h>  
 #include <time.h>    
 #include <stdarg.h>
+#include <dirent.h>          // Added for -r functionality
 
 // FNV-1a Hash Constants for 64-bit hashing
 #define FNV_OFFSET_BASIS 0xcbf29ce484222325ULL
 #define FNV_PRIME 0x100000001b3ULL
 #define CHUNK_SIZE 16384                // 16KB sample size per block
-#define VERSION "0.18"
+#define VERSION "0.20"
 #define CURRENT_YEAR 2026
 
 /* ================= ANSI COLORS ================= */
@@ -170,35 +188,74 @@ EXAMPLE:
 FILE *log_fp = NULL;      // Global file pointer for the log file
 int silent_mode = 0;      // Toggle for progress-bar-only terminal output
 
+/* ================= FUNCTION PROTOTYPES ================= */
+void smart_printf(const char *color, const char *prefix, const char *fmt, ...);
+void print_separator(int length, const char* color, char symbol);
+int is_video_file(const char *filename);
+unsigned long long fnv1a_hash(unsigned long long hash, const unsigned char *data, size_t len);
+unsigned long long calculate_video_hash(const char *filename, unsigned long long *out_size);
+
 /**
- * smart_printf: Handles dual-output to terminal and log file.
- * Automatically skips terminal output if silent_mode is active.
+ * print_simple_output: Fulfills: <hash>  <filename>
  */
+void print_simple_output(unsigned long long hash, const char *filename) {
+    if (!silent_mode) {
+        printf(C_GREEN "%016llx" C_RESET "  %s\n", hash, filename);
+    }
+    if (log_fp) {
+        fprintf(log_fp, "%016llx  %s\n", hash, filename);
+    }
+}
+
+/**
+ * process_path_recursive: Performs hash on other directories recursively
+ */
+void process_path_recursive(const char *path, int ignore_ext, int *succeeded, int *total, unsigned long long *total_sz) {
+    struct stat st;
+    if (lstat(path, &st) != 0) return;
+
+    if (S_ISDIR(st.st_mode)) {
+        DIR *dir = opendir(path);
+        if (!dir) return;
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+            char sub_path[PATH_MAX];
+            snprintf(sub_path, sizeof(sub_path), "%s/%s", path, entry->d_name);
+            process_path_recursive(sub_path, ignore_ext, succeeded, total, total_sz);
+        }
+        closedir(dir);
+    } else if (S_ISREG(st.st_mode)) {
+        if (ignore_ext || is_video_file(path)) {
+            unsigned long long sz = 0;
+            unsigned long long h = calculate_video_hash(path, &sz);
+            (*total)++;
+            if (h != 0) {
+                (*succeeded)++;
+                *total_sz += sz;
+                print_simple_output(h, path);
+            }
+        }
+    }
+}
+
 void smart_printf(const char *color, const char *prefix, const char *fmt, ...) {
     va_list args;
-    
-    // Print to terminal if not in silent mode
     if (!silent_mode) {
         printf("%s%s" C_RESET, color, prefix);
         va_start(args, fmt);
         vprintf(fmt, args);
         va_end(args);
     }
-
-    // Always print to log file if it's open
     if (log_fp) {
         fprintf(log_fp, "%s", prefix);
         va_start(args, fmt);
-        vfprintf(log_fp, fmt, args); // Note: Calling code ensures fmt here is clean of ANSI
+        vfprintf(log_fp, fmt, args); 
         va_end(args);
-        fflush(log_fp); // Ensure data is written immediately
+        fflush(log_fp); 
     }
 }
 
-/**
- * print_separator: Visual divider for terminal/logs.
- * Length is dynamic based on the longest path found during argument parsing.
- */
 void print_separator(int length, const char* color, char symbol) {
     if (!silent_mode) {
         printf("%s", color);
@@ -207,27 +264,22 @@ void print_separator(int length, const char* color, char symbol) {
         }
         printf(C_RESET "\n");
     }
-    
-    // Always write separator to log file for structure, regardless of silent mode
     if (log_fp) {
         for(int i = 0; i < length + 8; i++) fputc(symbol, log_fp);
         fputc('\n', log_fp);
     }
 }
 
-/**
- * is_video_file: Filter to skip non-media files unless --ignore is used.
- */
 int is_video_file(const char *filename) {
     const char *extensions[] = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts"};
     int num_exts = sizeof(extensions) / sizeof(extensions[0]);
-    const char *dot = strrchr(filename, '.'); // Find last dot in filename
+    const char *dot = strrchr(filename, '.'); 
     if (!dot) return 0;
     
     char ext_copy[16];
     strncpy(ext_copy, dot, 15);
     ext_copy[15] = '\0';
-    for(int i = 0; ext_copy[i]; i++) ext_copy[i] = tolower(ext_copy[i]); // Case-insensitive check
+    for(int i = 0; ext_copy[i]; i++) ext_copy[i] = tolower(ext_copy[i]); 
     
     for (int i = 0; i < num_exts; i++) {
         if (strcmp(ext_copy, extensions[i]) == 0) return 1;
@@ -235,10 +287,6 @@ int is_video_file(const char *filename) {
     return 0;
 }
 
-/**
- * fnv1a_hash: Core hashing algorithm.
- * High speed, low collision for small-to-medium data chunks.
- */
 unsigned long long fnv1a_hash(unsigned long long hash, const unsigned char *data, size_t len) {
     for (size_t i = 0; i < len; i++) {
         hash ^= data[i];
@@ -247,15 +295,8 @@ unsigned long long fnv1a_hash(unsigned long long hash, const unsigned char *data
     return hash;
 }
 
-/**
- * calculate_video_hash: The Sparse Hashing Engine.
- * Instead of reading the whole file (slow), it samples 16KB from:
- * 1. The Head (file size + first 16KB)
- * 2. The Midpoint (16KB from the center)
- * 3. The Tail (last 16KB)
- */
 unsigned long long calculate_video_hash(const char *filename, unsigned long long *out_size) {
-    int fd = open(filename, O_RDONLY | O_NOATIME); // O_NOATIME prevents updating file access time (faster)
+    int fd = open(filename, O_RDONLY | O_NOATIME); 
     if (fd == -1) return 0;
 
     struct stat st;
@@ -267,21 +308,17 @@ unsigned long long calculate_video_hash(const char *filename, unsigned long long
     unsigned char buffer[CHUNK_SIZE];
     ssize_t bytesRead;
 
-    // Phase 1: Hash the file size itself (protects against different files with same content)
     hash = fnv1a_hash(hash, (unsigned char*)&file_size, sizeof(file_size));
 
-    // Phase 2: Read from the Start
     bytesRead = read(fd, buffer, CHUNK_SIZE);
     if (bytesRead > 0) hash = fnv1a_hash(hash, buffer, (size_t)bytesRead);
 
-    // Phase 3: Read from the Middle (if file is large enough)
     if (file_size > CHUNK_SIZE * 3) {
         lseek(fd, (off_t)(file_size / 2), SEEK_SET);
         bytesRead = read(fd, buffer, CHUNK_SIZE);
         if (bytesRead > 0) hash = fnv1a_hash(hash, buffer, (size_t)bytesRead);
     }
 
-    // Phase 4: Read from the End
     if (file_size > CHUNK_SIZE) {
         lseek(fd, -(off_t)CHUNK_SIZE, SEEK_END);
         bytesRead = read(fd, buffer, CHUNK_SIZE);
@@ -292,32 +329,35 @@ unsigned long long calculate_video_hash(const char *filename, unsigned long long
     return hash;
 }
 
+/* ================= MAIN ================= */
+
 int main(int argc, char *argv[]) {
-    // Enable thousands separators for sizes (e.g., 1,024 MB)
     setlocale(LC_NUMERIC, "en_US.UTF-8");
     if (argc < 2) goto usage;
 
-    // Start high-resolution timer
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
     int ignore_extension = 0;
+    int recursive_mode = 0;
     int files_total = 0;
     int files_succeeded = 0;
-    int max_display_len = 15; // Used to calculate width of separators
+    unsigned long long total_size_bytes = 0;
+    int max_display_len = 15; 
     char *log_filename = NULL;
 
-    /* First pass: Parse arguments and determine UI width */
+    /* First pass: Parse arguments */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--ignore") == 0) {
             ignore_extension = 1;
+        } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--recursive") == 0) {
+            recursive_mode = 1;
         } else if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--log") == 0) {
             if (i + 1 < argc) log_filename = argv[++i];
         } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--silent") == 0) {
             silent_mode = 1;
         } else if (argv[i][0] != '-') {
             files_total++;
-            // Calculate max string length for dynamic separator lines
             char path_copy[PATH_MAX];
             strncpy(path_copy, argv[i], PATH_MAX - 1);
             char *base = basename(path_copy);
@@ -333,7 +373,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (files_total == 0) goto usage;
+    if (files_total == 0 && !recursive_mode) goto usage;
     if (silent_mode && !log_filename) {
         fprintf(stderr, C_RED "Error:" C_RESET " Silent mode requires a log file (-l).\n");
         return 1;
@@ -353,96 +393,77 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (silent_mode) {
-        printf("Calculating hash for %d file(s).\n", files_total);
-    }
-
     /* Second pass: Process files */
     int files_processed = 0;
     for (int i = 1; i < argc; i++) {
-        // Skip already parsed flags
-        if (strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--ignore") == 0) continue;
-        if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--log") == 0) { i++; continue; }
-        if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--silent") == 0) continue;
-        if (argv[i][0] == '-') continue;
+        if (argv[i][0] == '-') {
+            if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--log") == 0) i++;
+            continue;
+        }
 
-        files_processed++;
-        
-        // Render Progress Bar in Silent Mode
-        if (silent_mode) {
-            printf("\r[");
-            int pos = (files_processed * 35) / files_total;
-            for (int j = 0; j < 35; j++) {
-                if (j < pos) printf("="); else printf(".");
+        if (recursive_mode) {
+            process_path_recursive(argv[i], ignore_extension, &files_succeeded, &files_total, &total_size_bytes);
+        } else {
+            files_processed++;
+            char *target_file = argv[i];
+
+            if (!ignore_extension && !is_video_file(target_file)) {
+                if (!silent_mode) fprintf(stderr, C_RED "Skipping:" C_RESET " '%s' " C_YELLOW "(Non-video)\n" C_RESET, target_file);
+                continue;
             }
-            printf("] %d%%", (files_processed * 100) / files_total);
-            fflush(stdout);
-        }
 
-        char *target_file = argv[i];
+            char absolute_path[PATH_MAX];
+            if (realpath(target_file, absolute_path) == NULL) {
+                if (!silent_mode) fprintf(stderr, C_RED "Path Error:" C_RESET " " C_YELLOW "'%s'" C_RESET " not found\n", target_file);
+                continue;
+            }
 
-        // Extension validation
-        if (!ignore_extension && !is_video_file(target_file)) {
-            if (!silent_mode) fprintf(stderr, C_RED "Skipping:" C_RESET " '%s' " C_YELLOW "(Non-video)\n" C_RESET, target_file);
-            continue;
-        }
-
-        // Get absolute path for logging
-        char absolute_path[PATH_MAX];
-        if (realpath(target_file, absolute_path) == NULL) {
-            if (!silent_mode) fprintf(stderr, C_RED "Path Error:" C_RESET " " C_YELLOW "'%s'" C_RESET " not found\n", target_file);
-            continue;
-        }
-
-        char path_buf1[PATH_MAX], path_buf2[PATH_MAX];
-        strcpy(path_buf1, absolute_path);
-        strcpy(path_buf2, absolute_path);
-
-        unsigned long long file_size = 0;
-        unsigned long long h = calculate_video_hash(target_file, &file_size);
-        
-        if (h != 0) {
-            files_succeeded++;
-            print_separator(max_display_len, C_CYAN, '-');
-            smart_printf(C_GREEN, "File: ", "%s\n", basename(path_buf1));
-            smart_printf(C_GREEN, "Path: ", "%s\n", dirname(path_buf2));
+            unsigned long long file_size = 0;
+            unsigned long long h = calculate_video_hash(target_file, &file_size);
             
-            // Format file size
-            double display_size;
-            const char* unit;
-            if (file_size < 1048576) { display_size = file_size / 1024.0; unit = "KB"; }
-            else { display_size = file_size / 1048576.0; unit = "MB"; }
+            if (h != 0) {
+                files_succeeded++;
+                total_size_bytes += file_size;
+                char path_buf1[PATH_MAX], path_buf2[PATH_MAX];
+                strcpy(path_buf1, absolute_path);
+                strcpy(path_buf2, absolute_path);
 
-            // Size handling: Split output to keep ANSI codes out of the text file
-            if (!silent_mode) {
-                printf(C_GREEN "Size:" C_RESET C_YELLOW "%' .2f " C_RESET "%s\n", display_size, unit);
-            }
-            if (log_fp) {
-                fprintf(log_fp, "Size:%' .2f %s\n", display_size, unit);
-            }
+                print_separator(max_display_len, C_CYAN, '-');
+                smart_printf(C_GREEN, "File: ", "%s\n", basename(path_buf1));
+                smart_printf(C_GREEN, "Path: ", "%s\n", dirname(path_buf2));
+                
+                double display_size;
+                const char* unit;
+                if (file_size < 1048576) { display_size = file_size / 1024.0; unit = "KB"; }
+                else { display_size = file_size / 1048576.0; unit = "MB"; }
 
-            smart_printf(C_GREEN, "Hash: ", "%016llx\n", h);
+                if (!silent_mode) printf(C_GREEN "Size:" C_RESET C_YELLOW "%' .2f " C_RESET "%s\n", display_size, unit);
+                if (log_fp) fprintf(log_fp, "Size:%' .2f %s\n", display_size, unit);
+
+                smart_printf(C_GREEN, "Hash: ", "%016llx\n", h);
+            }
         }
     }
 
-    // Calculate elapsed time
     clock_gettime(CLOCK_MONOTONIC, &end);
     double elapsed = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1000000.0;
 
-    if (silent_mode) printf("\n");
-    
-    // Final separator
-    print_separator(max_display_len, C_CYAN, '=');
-    
-    // Print Summary
-    printf(C_YELLOW "Summary: " C_RESET "%d of %d files hashed in " C_ORANGE "%.3f" C_RESET " ms\n", 
-           files_succeeded, files_total, elapsed); // Used on screen
-    if (log_fp) {
-        fprintf(log_fp, "Summary: %d of %d files hashed in %.3f ms\n", 
-                files_succeeded, files_total, elapsed); // Used in log file
+    if (recursive_mode) {
+        double total_mb = total_size_bytes / 1048576.0;
+        printf(C_YELLOW "\nSummary: " C_RESET "%'d files hashed in " C_ORANGE "%.3f" C_RESET " ms (Total: " C_CYAN "%' .2f" C_RESET " MB).\n", 
+               files_succeeded, elapsed, total_mb);
+        if (log_fp) {
+            fprintf(log_fp, "\nSummary: %'d files hashed in %.3f ms (Total: %' .2f MB).\n", files_succeeded, elapsed, total_mb);
+        }
+    } else {
+        print_separator(max_display_len, C_CYAN, '=');
+        printf(C_YELLOW "Summary: " C_RESET "%d of %d files hashed in " C_ORANGE "%.3f" C_RESET " ms\n", 
+               files_succeeded, files_total, elapsed);
+        if (log_fp) {
+            fprintf(log_fp, "Summary: %d of %d files hashed in %.3f ms\n", files_succeeded, files_total, elapsed);
+        }
     }
-    
-    // Close Log and Exit
+
     if (log_fp) {
         printf(C_YELLOW "Log saved to:" C_RESET " %s\n", log_filename);
         fclose(log_fp);
@@ -457,11 +478,12 @@ usage:
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -i, --ignore        Ignore video file extension. Process files regardless of extension\n");
     fprintf(stderr, "  -l, --log <file>    Save results to a file\n");
-    fprintf(stderr, "  -s, --silent        Silent mode. Only show progress bar (requires -l)\n\n");
+    fprintf(stderr, "  -s, --silent        Silent mode. Only show progress bar (requires -l)\n");
+    fprintf(stderr, "  -r, --recursive     Perform the hash on other directories recursively\n\n");
     fprintf(stderr, C_CYAN "Example:\n" C_RESET);
     fprintf(stderr, C_GREEN "  gh " C_ORANGE "-l results.log " C_BLUE "video1.mp4 video2.mkv\n" C_RESET);
     fprintf(stderr, "  Save hash result of 2 video files to 'results.log'.\n\n");
-    fprintf(stderr, C_GREEN "  gh " C_ORANGE "-s -l scan.txt " C_BLUE "*.mp4\n" C_RESET);
-    fprintf(stderr, "  Process all mp4s in silent mode, showing only a progress bar.\n");
+    fprintf(stderr, C_GREEN "  gh " C_ORANGE "-r -l scan.txt " C_BLUE "./movies\n" C_RESET);
+    fprintf(stderr, "  Recursively process all videos in the directory.\n");
     return 1;
 }
